@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1420">
+<title>实时字幕 · 英/日 → 中文</title>
+<link rel="stylesheet" href="styles.css">
+<script src="vendor/vosk.js"></script>
+</head>
+<body>
+<header>
+  <h1>实时字幕 <span class="sub">离线 · 英/日 → 中</span></h1>
+  <div class="header-right">
+    <select id="lang" title="源语言">
+      <option value="en">英语 → 中文</option>
+      <option value="ja">日语 → 中文</option>
+    </select>
+    <span id="status-dot" class="dot dot-idle" title="引擎状态"></span>
+  </div>
+</header>
+
+<main>
+  <section id="player-wrap">
+    <video id="video" playsinline controls preload="metadata"></video>
+    <div id="subtitle-overlay" class="hidden">
+      <div id="sub-original"></div>
+      <div id="sub-zh"></div>
+    </div>
+  </section>
+
+  <section id="source-controls">
+    <label class="btn" for="file-input">📁 选择视频文件</label>
+    <input type="file" id="file-input" accept="video/*,audio/*" hidden>
+    <div class="url-row">
+      <input type="url" id="url-input" placeholder="或粘贴视频直链（部分网站跨域限制会无声）">
+      <button id="load-url">加载</button>
+    </div>
+  </section>
+
+  <section id="actions">
+    <button id="start-btn" class="primary">开始识别</button>
+    <button id="pip-btn" disabled>📺 画中画字幕</button>
+    <label class="check"><input type="checkbox" id="show-original" checked> 原文</label>
+    <label class="check"><input type="checkbox" id="show-history" checked> 历史</label>
+  </section>
+
+  <div id="progress-area">
+    <div id="progress-text">选择视频，点击「开始识别」（首次使用需下载模型，之后有缓存）</div>
+    <div id="progress-bar" class="hidden"><div id="progress-fill"></div></div>
+  </div>
+
+  <div id="error-area" class="hidden"></div>
+
+  <section id="history" class="hidden"></section>
+
+  <footer>
+    <p>纯本地离线运行：识别 (Vosk) 与翻译 (OPUS-MT) 模型均在本机浏览器中执行，音频不上传。</p>
+    <p>提示：翻译为离线小模型，「看懂大意」级别。英文模式每句约 1~2 秒；日语经英语中转，每句约 3~10 秒（视句长与设备性能）。</p>
+  </footer>
+</main>
+
+<canvas id="pip-canvas" width="480" height="270" class="hidden"></canvas>
+<video id="pip-video" muted playsinline class="hidden"></video>
+
+<script src="app.js"></script>
+<script src="app-bridge.js"></script>
+</body>
+</html>

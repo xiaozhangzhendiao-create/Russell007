@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">实时字幕</string>
+    <string name="start_capture">▶ 开始字幕</string>
+    <string name="stop_capture">■ 停止</string>
+    <string name="lang_en">英语 → 中文</string>
+    <string name="lang_ja">日语 → 中文</string>
+    <string name="step1">1. 点击「开始字幕」，允许「屏幕录制」（用于内录其他 App 的声音）</string>
+    <string name="step2">2. 首次启动需允许「显示在其他应用上层」（悬浮字幕窗口）</string>
+    <string name="step3">3. 打开任意视频 App 播放，字幕会悬浮在屏幕下方</string>
+    <string name="step4">4. 首次使用会下载模型（英语约 150MB / 日语约 260MB），之后离线可用</string>
+    <string name="status_idle">状态：未启动</string>
+</resources>
