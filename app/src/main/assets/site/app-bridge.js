@@ -8,6 +8,33 @@
   const params = new URLSearchParams(location.search);
   if (params.get('app') !== '1') return;
 
+  // App 模式下把进度/错误直接显示在字幕区（悬浮窗里没有其他可见 UI）
+  function showAppStatus(text) {
+    const zh = document.getElementById('sub-zh');
+    if (!zh) return;
+    if (text) {
+      zh.textContent = text;
+      zh.classList.remove('pending');
+      zh.style.fontSize = '13px';
+      zh.style.opacity = '0.75';
+    } else {
+      zh.textContent = '';
+      zh.style.fontSize = '';
+      zh.style.opacity = '';
+    }
+  }
+  window.__showAppStatus = showAppStatus;
+
+  // progress-area 在悬浮窗里被隐藏，轮询其文本镜像到字幕区（setProgress 是 const，无法劫持）
+  setInterval(() => {
+    if (window.__appReady) return;
+    const pt = document.getElementById('progress-text');
+    if (pt && pt.textContent && !pt.textContent.startsWith('识别运行中')) {
+      const cur = document.getElementById('sub-zh');
+      if (cur && cur.textContent !== pt.textContent) showAppStatus(pt.textContent);
+    }
+  }, 800);
+
   function applyChrome() {
     document.documentElement.style.background = 'transparent';
     if (document.body) {
@@ -65,26 +92,29 @@
       window.__appStarted = true;
       langSel.value = lang === 'ja' ? 'ja' : 'en';
       setStatus('loading');
-      setProgress('加载识别模型（首次约 40~50MB）…', null);
+      showAppStatus('加载识别模型（首次约 40~50MB）…');
       if (!state.asrModel || state.asrLang !== langSel.value) {
         state.asrModel = await loadAsr(langSel.value);
         state.asrLang = langSel.value;
       }
-      setProgress('加载翻译模型（首次约 110~210MB）…', null);
+      showAppStatus('加载翻译模型（首次约 110~210MB）…');
       await preloadMt(langSel.value);
       if (state.recognizer) { try { state.recognizer.remove(); } catch (e) {} }
       const rec = new state.asrModel.KaldiRecognizer(16000);
       rec.on('result', (msg) => onFinal(msg.result ? msg.result.text : ''));
       rec.on('partialresult', (msg) => onPartial(msg.result ? msg.result.partial : ''));
       state.recognizer = rec;
+      window.__appRec = rec; // __feedAudio 从这里取识别器
       state.running = true;
       overlay.classList.remove('hidden');
       applyChrome();
       setStatus('ready');
       setProgress('识别运行中', null);
+      showAppStatus(''); // 就绪后清除状态字
       window.__appReady = true;
     } catch (e) {
       window.__appError = String((e && e.message) || e);
+      showAppStatus('⚠ 字幕引擎启动失败: ' + window.__appError);
       setStatus('error');
     }
   };

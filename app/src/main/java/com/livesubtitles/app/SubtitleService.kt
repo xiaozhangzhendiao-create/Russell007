@@ -125,8 +125,11 @@ class SubtitleService : Service() {
                 request: WebResourceRequest,
             ): WebResourceResponse? {
                 val path = request.url.path ?: return null
-                if (path.startsWith("/models/")) {
-                    return try { serveModel(request) } catch (e: Exception) { notFound() }
+                // 页面在 /assets/site/ 下，相对路径 ./models/... 会解析为
+                // /assets/site/models/...；统一按 "最后一个 /models/ 之后" 提取
+                if (path.contains("/models/")) {
+                    val rel = path.substringAfter("/models/").trimStart('/')
+                    return try { serveModelRel(rel) } catch (e: Exception) { notFound() }
                 }
                 return loader.shouldInterceptRequest(request.url)
             }
@@ -209,8 +212,8 @@ class SubtitleService : Service() {
             "https://hf-mirror.com/localstack/vosk-models/resolve/main/vosk-model-small-ja-0.22.zip",
     )
 
-    private fun serveModel(request: WebResourceRequest): WebResourceResponse? {
-        val rel = request.url.path?.removePrefix("/models/")?.trimStart('/') ?: return notFound()
+    private fun serveModelRel(rel: String): WebResourceResponse? {
+        if (rel.isEmpty()) return notFound()
 
         zipSources[rel]?.let { url ->
             return serveCached(url, rel, "application/zip")
