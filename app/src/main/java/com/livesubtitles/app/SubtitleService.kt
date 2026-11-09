@@ -38,7 +38,7 @@ import java.nio.ByteOrder
  * 前台服务：
  * 1) MediaProjection 内录其他 App 的媒体音频，重采样为 16kHz 单声道
  * 2) 悬浮透明 WebView（不可触摸），运行与网页版同一套识别+翻译+字幕代码
- * 3) /models/** 请求代理：本地缓存优先，未命中从 hf-mirror 下载（中国网络可达）
+ * 3) /models/ 路径请求代理：本地缓存优先，未命中从 hf-mirror 下载（中国网络可达）
  */
 class SubtitleService : Service() {
 
