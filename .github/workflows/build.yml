@@ -36,7 +36,12 @@ jobs:
       - name: Report error tail as annotations
         if: failure()
         run: |
-          tail -c 9000 build-output.log > errtail.txt || true
+          {
+            echo '===== 编译错误行 ====='
+            grep -E "^e: " build-output.log | tail -30
+            echo '===== 日志最后 2200 字符 ====='
+            tail -c 2200 build-output.log
+          } > errtail.txt 2>/dev/null || tail -c 8500 build-output.log > errtail.txt
           python3 - <<'EOF'
           import base64
           data = open('errtail.txt', 'rb').read()
