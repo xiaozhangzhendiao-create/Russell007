@@ -33,6 +33,18 @@ jobs:
           name: build-log
           path: build-output.log
 
+      - name: Report error tail as annotations
+        if: failure()
+        run: |
+          tail -c 9000 build-output.log > errtail.txt || true
+          python3 - <<'EOF'
+          import base64
+          data = open('errtail.txt', 'rb').read()
+          chunks = [data[i:i + 700] for i in range(0, len(data), 700)]
+          for i, c in enumerate(chunks):
+              print(f"::error title=err{i}::{base64.b64encode(c).decode()}")
+          EOF
+
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
