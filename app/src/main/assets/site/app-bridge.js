@@ -26,6 +26,22 @@
   }
   window.__showAppStatus = showAppStatus;
 
+  // 就绪标记：READY 显示后，第一句字幕出现时自动清除
+  function resetReadyMark() {
+    if (!window.__readyShown) return;
+    window.__readyShown = false;
+    const zh = document.getElementById('sub-zh');
+    if (zh) zh.style.color = '';
+  }
+  if (typeof onPartial === 'function') {
+    const origPartial = onPartial;
+    onPartial = function (t) { resetReadyMark(); origPartial(t); };
+  }
+  if (typeof onFinal === 'function') {
+    const origFinal = onFinal;
+    onFinal = function (t) { resetReadyMark(); origFinal(t); };
+  }
+
   // 字幕样式控制（原生控制条调用）：胶囊底 + 可调字号/透明度
   window.__setSubStyle = function (size, opacity) {
     const ov = document.getElementById('subtitle-overlay');
@@ -135,7 +151,15 @@
       applyChrome();
       setStatus('ready');
       setProgress('识别运行中', null);
-      showAppStatus(''); // 就绪后清除状态字
+      // 就绪标识：绿色 READY，直到第一句字幕出现
+      showAppStatus('');
+      const zhReady = document.getElementById('sub-zh');
+      if (zhReady) {
+        window.__readyShown = true;
+        zhReady.textContent = '✅ READY · 模型就绪，开始播放吧';
+        zhReady.classList.remove('pending');
+        zhReady.style.color = '#7CFFB2';
+      }
       window.__appReady = true;
       console.log('[bridge] READY');
     } catch (e) {
