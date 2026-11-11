@@ -18,6 +18,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.util.Base64
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -45,10 +46,8 @@ import java.util.Locale
 /**
  * 前台服务：
  * 1) MediaProjection 内录其他 App 的媒体音频，重采样为 16kHz 单声道
- * 2) 悬浮窗 = 原生调试条(顶部) + 透明 WebView(下方)，WebView 运行网页版同款识别+翻译+字幕
+ * 2) 两个悬浮窗：字幕窗（透明 WebView，触摸穿透）+ 控制条窗（可触摸：拖动/字号/透明度/关闭）
  * 3) /models/ 路径请求代理：本地缓存优先，未命中从 hf-mirror 下载（中国网络可达）
- *
- * 调试条显示最近 3 条内部日志（页面加载/JS 控制台/音频喂数/探针结果），用于远程排错。
  */
 class SubtitleService : Service() {
 
@@ -57,25 +56,22 @@ class SubtitleService : Service() {
     private var captureThread: Thread? = null
     private var webView: WebView? = null
     private var mainHandler: Handler? = null
-    private var debugView: TextView? = null
+    private var subtitleRoot: View? = null
+    private var controlRoot: View? = null
+    private var subParams: WindowManager.LayoutParams? = null
+    private var ctrlParams: WindowManager.LayoutParams? = null
+    private var wm: WindowManager? = null
     private var logFile: File? = null
-    private val logLines = ArrayDeque<String>()
     @Volatile private var running = false
     @Volatile private var chunkCount = 0L
-
+    private var fontSize = 22
+    private var bgOpacity = 35 // 百分比
     private val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     private fun log(msg: String) {
         val line = "[${fmt.format(Date())}] $msg"
-        synchronized(logLines) {
-            logLines.addLast(line)
-            while (logLines.size > 60) logLines.removeFirst()
-        }
         try { logFile?.appendText(line + "\n") } catch (_: Exception) {}
         android.util.Log.i("LiveSub", line)
-        mainHandler?.post {
-            debugView?.text = synchronized(logLines) { logLines.takeLast(3).joinToString("\n") }
-        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -86,8 +82,12 @@ class SubtitleService : Service() {
         val data: Intent = intent.getParcelableExtra("data") ?: run { stopSelf(); return START_NOT_STICKY }
         val lang = intent.getStringExtra("lang") ?: "en"
 
+        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        fontSize = prefs.getInt("fontSize", 22)
+        bgOpacity = prefs.getInt("bgOpacity", 35)
+
         logFile = File(filesDir, "live-subtitles.log")
-        log("service start, lang=$lang, sdk=${android.os.Build.VERSION.SDK_INT}")
+        log("service start, lang=$lang, font=$fontSize, opacity=$bgOpacity, sdk=${android.os.Build.VERSION.SDK_INT}")
 
         // API 34+ 要求：必须在 getMediaProjection 之前进入 mediaProjection 类型的前台服务
         createNotificationChannel()
@@ -103,7 +103,8 @@ class SubtitleService : Service() {
         )
 
         mainHandler = Handler(mainLooper)
-        setupOverlayWebView(lang)
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        setupOverlays(lang)
 
         val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projection = try {
@@ -112,49 +113,71 @@ class SubtitleService : Service() {
             log("getMediaProjection FAILED: $e")
             stopSelf(); return START_NOT_STICKY
         }
-        log("media projection acquired")
         projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { log("projection stopped by system"); stopSelf() }
+            override fun onStop() { stopSelf() }
         }, mainHandler)
 
         startCapture()
         return START_NOT_STICKY
     }
 
-    /* ---------------- 悬浮窗：调试条 + WebView ---------------- */
+    /* ---------------- 悬浮窗：字幕窗（穿透） + 控制条（可拖） ---------------- */
 
-    private fun setupOverlayWebView(lang: String) {
-        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun setupOverlays(lang: String) {
+        val windowManager = wm ?: return
         val h = resources.displayMetrics.heightPixels
-        val params = WindowManager.LayoutParams(
+        val subH = (h * 0.24).toInt()
+
+        // —— 字幕窗：不可触摸，触摸事件全部穿透 ——
+        subParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
-            (h * 0.26).toInt(),
+            subH,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT,
         )
-        params.gravity = Gravity.BOTTOM or Gravity.START
-        params.x = 0
-        params.y = 0
+        subParams!!.gravity = Gravity.BOTTOM or Gravity.START
+        subParams!!.x = 0
+        subParams!!.y = 0
 
-        val box = LinearLayout(this).apply {
+        val wv = createWebView(lang)
+        val subBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xB3222222.toInt())
+            setBackgroundColor(Color.TRANSPARENT)
         }
-        val tv = TextView(this).apply {
-            setTextColor(0xFF7CFFB2.toInt())
-            textSize = 9f
-            setPadding(10, 4, 10, 4)
-            maxLines = 3
-        }
-        box.addView(tv, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        subBox.addView(wv, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        windowManager.addView(subBox, subParams)
+        subtitleRoot = subBox
+        webView = wv
 
+        // —— 控制条窗：可触摸（拖动/字号/透明度/关闭） ——
+        ctrlParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT,
+        )
+        ctrlParams!!.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        ctrlParams!!.y = subH + dp(4)
+        ctrlParams!!.x = 0
+
+        val bar = buildControlBar(windowManager)
+        windowManager.addView(bar, ctrlParams)
+        controlRoot = bar
+
+        log("overlays added; loading page…")
+        wv.loadUrl("https://appassets.androidplatform.net/assets/site/index.html?lang=$lang&app=1")
+    }
+
+    private fun createWebView(lang: String): WebView {
         val wv = WebView(this)
-        wv.layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         wv.setBackgroundColor(Color.TRANSPARENT)
         wv.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         wv.settings.javaScriptEnabled = true
@@ -162,13 +185,6 @@ class SubtitleService : Service() {
         wv.settings.mediaPlaybackRequiresUserGesture = false
         wv.settings.cacheMode = WebSettings.LOAD_DEFAULT
         wv.settings.allowFileAccess = false
-        wv.settings.javaScriptCanOpenWindowsAutomatically = true
-        box.addView(wv)
-
-        wm.addView(box, params)
-        debugView = tv
-        webView = wv
-        log("overlay window added (${wv.settings.userAgentString.take(40)})")
 
         val loader = WebViewAssetLoader.Builder()
             .setDomain("appassets.androidplatform.net")
@@ -189,55 +205,116 @@ class SubtitleService : Service() {
                         log("model serve FAILED $rel: $e")
                         notFound()
                     }
-                    if (resp != null) log("model hit: $rel")
                     return resp
                 }
                 return loader.shouldInterceptRequest(request.url)
             }
 
-            override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
-                super.onPageStarted(view, url, favicon)
-                log("page started: ${url.take(80)}")
-            }
-
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
-                log("page finished: ${url.take(80)}")
+                log("page finished")
                 mainHandler?.post {
                     view.evaluateJavascript(
                         "window.__appStart && window.__appStart('$lang')", null,
                     )
                 }
-                // 探针：确认页面内部状态（0s/6s/16s 各一次）
-                listOf(0L, 6000L, 16000L).forEach { d ->
-                    mainHandler?.postDelayed({
-                        webView?.evaluateJavascript(PROBE_JS) { r ->
-                            log("probe: " + r.take(280))
-                        }
-                    }, d)
-                }
-            }
-
-            override fun onReceivedError(
-                view: WebView,
-                request: WebResourceRequest,
-                error: android.webkit.WebResourceError,
-            ) {
-                super.onReceivedError(view, request, error)
-                if (request.isForMainFrame) {
-                    log("page ERROR: ${error.description} ${request.url}")
+                // 应用字号/透明度（等桥接就绪，多试两次）
+                listOf(1500L, 4000L).forEach { d ->
+                    mainHandler?.postDelayed({ applyStyleToWeb() }, d)
                 }
             }
         }
         wv.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(message: ConsoleMessage): Boolean {
-                log("JS[${message.messageLevel()}] ${message.message().take(160)} @${message.lineNumber()}")
+                log("JS[${message.messageLevel()}] ${message.message().take(140)}")
                 return true
             }
         }
+        return wv
+    }
 
-        log("loading page…")
-        wv.loadUrl("https://appassets.androidplatform.net/assets/site/index.html?lang=$lang&app=1")
+    private fun applyStyleToWeb() {
+        webView?.evaluateJavascript(
+            "window.__setSubStyle && window.__setSubStyle($fontSize, ${bgOpacity / 100.0})", null,
+        )
+    }
+
+    private fun buildControlBar(windowManager: WindowManager): LinearLayout {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundResource(R.drawable.control_bar_bg)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+        }
+
+        fun mkBtn(text: String, onClick: () -> Unit): TextView {
+            val tv = TextView(this)
+            tv.text = text
+            tv.setTextColor(0xFFE8ECF5.toInt())
+            tv.textSize = 15f
+            tv.setPadding(dp(12), dp(6), dp(12), dp(6))
+            tv.setOnClickListener { onClick() }
+            return tv
+        }
+
+        // 拖动把手
+        val handle = TextView(this).apply {
+            text = "⠿"
+            setTextColor(0xFF8B96AD.toInt())
+            textSize = 18f
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+        }
+        var downRawY = 0f
+        var startY = 0
+        handle.setOnTouchListener { _, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawY = ev.rawY
+                    startY = subParams?.y ?: 0
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val sp = subParams ?: return@setOnTouchListener true
+                    val cp = ctrlParams ?: return@setOnTouchListener true
+                    // gravity=BOTTOM：向上拖 → y 增大
+                    val dy = (downRawY - ev.rawY).toInt()
+                    val maxY = (resources.displayMetrics.heightPixels * 0.72).toInt()
+                    val ny = (startY + dy).coerceIn(0, maxY)
+                    sp.y = ny
+                    cp.y = ny + sp.height + dp(4)
+                    try {
+                        subtitleRoot?.let { windowManager.updateViewLayout(it, sp) }
+                        controlRoot?.let { windowManager.updateViewLayout(it, cp) }
+                    } catch (_: Exception) {}
+                    true
+                }
+                else -> false
+            }
+        }
+        bar.addView(handle)
+
+        bar.addView(mkBtn("A−") {
+            fontSize = (fontSize - 2).coerceAtLeast(14)
+            savePrefs(); applyStyleToWeb()
+        })
+        bar.addView(mkBtn("A+") {
+            fontSize = (fontSize + 2).coerceAtMost(36)
+            savePrefs(); applyStyleToWeb()
+        })
+        bar.addView(mkBtn("◐") {
+            bgOpacity = when (bgOpacity) { 35 -> 15; 15 -> 55; else -> 35 }
+            savePrefs(); applyStyleToWeb()
+        })
+        bar.addView(mkBtn("✕") { stopSelf() })
+        return bar
+    }
+
+    private fun savePrefs() {
+        getSharedPreferences("settings", MODE_PRIVATE)
+            .edit()
+            .putInt("fontSize", fontSize)
+            .putInt("bgOpacity", bgOpacity)
+            .apply()
     }
 
     /* ---------------- 音频内录 ---------------- */
@@ -266,13 +343,12 @@ class SubtitleService : Service() {
             audioRecord = record
             record.startRecording()
             running = true
-            log("audio capture started, state=${record.recordingState}")
+            log("audio capture started")
 
             captureThread = Thread {
                 val chunkFloats = 8000 // 0.5 秒 @16kHz
                 val floatBuf = FloatArray(chunkFloats)
                 val byteBuf = ByteBuffer.allocate(chunkFloats * 4).order(ByteOrder.LITTLE_ENDIAN)
-                var silentMax = 0f
                 while (running) {
                     var total = 0
                     while (total < chunkFloats && running) {
@@ -282,14 +358,7 @@ class SubtitleService : Service() {
                     }
                     if (total <= 0) break
                     chunkCount++
-                    if (chunkCount % 40L == 0L) { // 每 ~20 秒报告一次
-                        for (i in 0 until total step 7) {
-                            val v = Math.abs(floatBuf[i])
-                            if (v > silentMax) silentMax = v
-                        }
-                        log("fed ${chunkCount} chunks, peak≈${"%.3f".format(silentMax)}")
-                        silentMax = 0f
-                    }
+                    if (chunkCount % 120L == 0L) log("fed ${chunkCount} chunks (~${chunkCount / 2}s)")
                     byteBuf.clear()
                     for (i in 0 until total) byteBuf.putFloat(floatBuf[i])
                     val b64 = Base64.encodeToString(byteBuf.array(), Base64.NO_WRAP)
@@ -337,7 +406,6 @@ class SubtitleService : Service() {
         }
         val mime = when {
             tail.endsWith(".json") -> "application/json"
-            tail.endsWith(".onnx") || tail.endsWith(".spm") -> "application/octet-stream"
             else -> "application/octet-stream"
         }
         return serveCached(entry.value + repoPath, rel, mime)
@@ -406,34 +474,23 @@ class SubtitleService : Service() {
         audioRecord = null
         try { projection?.stop() } catch (_: Exception) {}
         projection = null
-        try {
-            mainHandler?.post {
-                webView?.let { wv ->
-                    try {
-                        (wv.parent as? ViewGroup)?.removeView(wv)
-                        wv.destroy()
-                    } catch (_: Exception) {}
-                }
-                webView = null
+        mainHandler?.post {
+            subtitleRoot?.let { v ->
+                try { (wm)?.removeView(v) } catch (_: Exception) {}
             }
-        } catch (_: Exception) {}
+            controlRoot?.let { v ->
+                try { (wm)?.removeView(v) } catch (_: Exception) {}
+            }
+            webView?.let { wv ->
+                try { wv.destroy() } catch (_: Exception) {}
+            }
+            subtitleRoot = null; controlRoot = null; webView = null
+        }
         super.onDestroy()
     }
 
     companion object {
         private const val CHANNEL_ID = "live_subtitle"
         private const val NOTIF_ID = 100
-
-        // 探针：读取页面内部状态（__appReady/__appError/桥接函数是否就位）
-        private const val PROBE_JS = (
-            "(function(){try{return JSON.stringify({" +
-                "ready:!!window.__appReady," +
-                "started:!!window.__appStarted," +
-                "err:window.__appError||null," +
-                "vosk:typeof Vosk," +
-                "feed:typeof window.__feedAudio," +
-                "sub:" + "(function(){var z=document.getElementById('sub-zh');return z?z.textContent.slice(0,40):'no-el'})()" +
-            "})}catch(e){return 'probe-err:'+e}})()"
-        )
     }
 }

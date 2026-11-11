@@ -26,6 +26,25 @@
   }
   window.__showAppStatus = showAppStatus;
 
+  // 字幕样式控制（原生控制条调用）：胶囊底 + 可调字号/透明度
+  window.__setSubStyle = function (size, opacity) {
+    const ov = document.getElementById('subtitle-overlay');
+    const zh = document.getElementById('sub-zh');
+    if (!ov || !zh) return;
+    ov.style.width = 'fit-content';
+    ov.style.maxWidth = '94%';
+    ov.style.left = '0';
+    ov.style.right = '0';
+    ov.style.margin = '0 auto';
+    ov.style.bottom = '6px';
+    ov.style.background = 'rgba(8, 10, 18, ' + opacity + ')';
+    ov.style.borderRadius = '16px';
+    ov.style.padding = '8px 18px 10px';
+    ov.style.boxShadow = '0 2px 12px rgba(0,0,0,0.35)';
+    zh.style.fontSize = size + 'px';
+    zh.style.lineHeight = '1.4';
+  };
+
   // progress-area 在悬浮窗里被隐藏，轮询其文本镜像到字幕区（setProgress 是 const，无法劫持）
   setInterval(() => {
     if (window.__appReady) return;
