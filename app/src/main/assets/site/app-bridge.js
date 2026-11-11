@@ -6,6 +6,7 @@
  */
 (function () {
   const params = new URLSearchParams(location.search);
+  console.log('[bridge] init, app=' + params.get('app') + ', lang=' + params.get('lang') + ', vosk=' + typeof Vosk);
   if (params.get('app') !== '1') return;
 
   // App 模式下把进度/错误直接显示在字幕区（悬浮窗里没有其他可见 UI）
@@ -34,6 +35,8 @@
       if (cur && cur.textContent !== pt.textContent) showAppStatus(pt.textContent);
     }
   }, 800);
+
+  window.addEventListener('DOMContentLoaded', () => console.log('[bridge] chrome applied'));
 
   function applyChrome() {
     document.documentElement.style.background = 'transparent';
@@ -90,6 +93,7 @@
     try {
       if (window.__appStarted) return;
       window.__appStarted = true;
+      console.log('[bridge] appStart begin, lang=' + lang);
       langSel.value = lang === 'ja' ? 'ja' : 'en';
       setStatus('loading');
       showAppStatus('加载识别模型（首次约 40~50MB）…');
@@ -97,8 +101,10 @@
         state.asrModel = await loadAsr(langSel.value);
         state.asrLang = langSel.value;
       }
+      console.log('[bridge] asr model loaded');
       showAppStatus('加载翻译模型（首次约 110~210MB）…');
       await preloadMt(langSel.value);
+      console.log('[bridge] mt preloaded');
       if (state.recognizer) { try { state.recognizer.remove(); } catch (e) {} }
       const rec = new state.asrModel.KaldiRecognizer(16000);
       rec.on('result', (msg) => onFinal(msg.result ? msg.result.text : ''));
@@ -112,8 +118,10 @@
       setProgress('识别运行中', null);
       showAppStatus(''); // 就绪后清除状态字
       window.__appReady = true;
+      console.log('[bridge] READY');
     } catch (e) {
       window.__appError = String((e && e.message) || e);
+      console.error('[bridge] appStart FAILED: ' + window.__appError);
       showAppStatus('⚠ 字幕引擎启动失败: ' + window.__appError);
       setStatus('error');
     }

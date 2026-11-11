@@ -19,12 +19,17 @@ import android.os.IBinder
 import android.util.Base64
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.webkit.WebViewAssetLoader
 import java.io.File
 import java.io.FileOutputStream
@@ -33,12 +38,17 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * 前台服务：
  * 1) MediaProjection 内录其他 App 的媒体音频，重采样为 16kHz 单声道
- * 2) 悬浮透明 WebView（不可触摸），运行与网页版同一套识别+翻译+字幕代码
+ * 2) 悬浮窗 = 原生调试条(顶部) + 透明 WebView(下方)，WebView 运行网页版同款识别+翻译+字幕
  * 3) /models/ 路径请求代理：本地缓存优先，未命中从 hf-mirror 下载（中国网络可达）
+ *
+ * 调试条显示最近 3 条内部日志（页面加载/JS 控制台/音频喂数/探针结果），用于远程排错。
  */
 class SubtitleService : Service() {
 
@@ -47,7 +57,26 @@ class SubtitleService : Service() {
     private var captureThread: Thread? = null
     private var webView: WebView? = null
     private var mainHandler: Handler? = null
+    private var debugView: TextView? = null
+    private var logFile: File? = null
+    private val logLines = ArrayDeque<String>()
     @Volatile private var running = false
+    @Volatile private var chunkCount = 0L
+
+    private val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+
+    private fun log(msg: String) {
+        val line = "[${fmt.format(Date())}] $msg"
+        synchronized(logLines) {
+            logLines.addLast(line)
+            while (logLines.size > 60) logLines.removeFirst()
+        }
+        try { logFile?.appendText(line + "\n") } catch (_: Exception) {}
+        android.util.Log.i("LiveSub", line)
+        mainHandler?.post {
+            debugView?.text = synchronized(logLines) { logLines.takeLast(3).joinToString("\n") }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -56,6 +85,9 @@ class SubtitleService : Service() {
         val resultCode = intent.getIntExtra("resultCode", -1)
         val data: Intent = intent.getParcelableExtra("data") ?: run { stopSelf(); return START_NOT_STICKY }
         val lang = intent.getStringExtra("lang") ?: "en"
+
+        logFile = File(filesDir, "live-subtitles.log")
+        log("service start, lang=$lang, sdk=${android.os.Build.VERSION.SDK_INT}")
 
         // API 34+ 要求：必须在 getMediaProjection 之前进入 mediaProjection 类型的前台服务
         createNotificationChannel()
@@ -77,24 +109,26 @@ class SubtitleService : Service() {
         projection = try {
             mpm.getMediaProjection(resultCode, data)
         } catch (e: Exception) {
+            log("getMediaProjection FAILED: $e")
             stopSelf(); return START_NOT_STICKY
         }
+        log("media projection acquired")
         projection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { stopSelf() }
+            override fun onStop() { log("projection stopped by system"); stopSelf() }
         }, mainHandler)
 
         startCapture()
         return START_NOT_STICKY
     }
 
-    /* ---------------- 悬浮字幕 WebView ---------------- */
+    /* ---------------- 悬浮窗：调试条 + WebView ---------------- */
 
     private fun setupOverlayWebView(lang: String) {
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val h = resources.displayMetrics.heightPixels
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
-            (h * 0.24).toInt(),
+            (h * 0.26).toInt(),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
@@ -105,7 +139,22 @@ class SubtitleService : Service() {
         params.x = 0
         params.y = 0
 
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(0xB3222222.toInt())
+        }
+        val tv = TextView(this).apply {
+            setTextColor(0xFF7CFFB2.toInt())
+            textSize = 9f
+            setPadding(10, 4, 10, 4)
+            maxLines = 3
+        }
+        box.addView(tv, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
         val wv = WebView(this)
+        wv.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         wv.setBackgroundColor(Color.TRANSPARENT)
         wv.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         wv.settings.javaScriptEnabled = true
@@ -113,6 +162,13 @@ class SubtitleService : Service() {
         wv.settings.mediaPlaybackRequiresUserGesture = false
         wv.settings.cacheMode = WebSettings.LOAD_DEFAULT
         wv.settings.allowFileAccess = false
+        wv.settings.javaScriptCanOpenWindowsAutomatically = true
+        box.addView(wv)
+
+        wm.addView(box, params)
+        debugView = tv
+        webView = wv
+        log("overlay window added (${wv.settings.userAgentString.take(40)})")
 
         val loader = WebViewAssetLoader.Builder()
             .setDomain("appassets.androidplatform.net")
@@ -129,74 +185,125 @@ class SubtitleService : Service() {
                 // /assets/site/models/...；统一按 "最后一个 /models/ 之后" 提取
                 if (path.contains("/models/")) {
                     val rel = path.substringAfter("/models/").trimStart('/')
-                    return try { serveModelRel(rel) } catch (e: Exception) { notFound() }
+                    val resp = try { serveModelRel(rel) } catch (e: Exception) {
+                        log("model serve FAILED $rel: $e")
+                        notFound()
+                    }
+                    if (resp != null) log("model hit: $rel")
+                    return resp
                 }
                 return loader.shouldInterceptRequest(request.url)
             }
 
+            override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                log("page started: ${url.take(80)}")
+            }
+
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                log("page finished: ${url.take(80)}")
                 mainHandler?.post {
                     view.evaluateJavascript(
                         "window.__appStart && window.__appStart('$lang')", null,
                     )
                 }
+                // 探针：确认页面内部状态（0s/6s/16s 各一次）
+                listOf(0L, 6000L, 16000L).forEach { d ->
+                    mainHandler?.postDelayed({
+                        webView?.evaluateJavascript(PROBE_JS) { r ->
+                            log("probe: " + r.take(280))
+                        }
+                    }, d)
+                }
+            }
+
+            override fun onReceivedError(
+                view: WebView,
+                request: WebResourceRequest,
+                error: android.webkit.WebResourceError,
+            ) {
+                super.onReceivedError(view, request, error)
+                if (request.isForMainFrame) {
+                    log("page ERROR: ${error.description} ${request.url}")
+                }
+            }
+        }
+        wv.webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+                log("JS[${message.messageLevel()}] ${message.message().take(160)} @${message.lineNumber()}")
+                return true
             }
         }
 
-        wm.addView(wv, params)
-        webView = wv
+        log("loading page…")
         wv.loadUrl("https://appassets.androidplatform.net/assets/site/index.html?lang=$lang&app=1")
     }
 
     /* ---------------- 音频内录 ---------------- */
 
     private fun startCapture() {
-        val proj = projection ?: return
-        val captureConfig = AudioPlaybackCaptureConfiguration.Builder(proj)
-            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-            .addMatchingUsage(AudioAttributes.USAGE_GAME)
-            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-            .build()
-        val format = AudioFormat.Builder()
-            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-            .setSampleRate(16000)
-            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-            .build()
-        val minBuf = AudioRecord.getMinBufferSize(
-            16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT,
-        )
-        val record = AudioRecord.Builder()
-            .setAudioFormat(format)
-            .setBufferSizeInBytes(maxOf(minBuf * 4, 65536))
-            .setAudioPlaybackCaptureConfig(captureConfig)
-            .build()
-        audioRecord = record
-        record.startRecording()
-        running = true
+        try {
+            val proj = projection ?: return
+            val captureConfig = AudioPlaybackCaptureConfiguration.Builder(proj)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                .build()
+            val format = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                .setSampleRate(16000)
+                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                .build()
+            val minBuf = AudioRecord.getMinBufferSize(
+                16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT,
+            )
+            val record = AudioRecord.Builder()
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(maxOf(minBuf * 4, 65536))
+                .setAudioPlaybackCaptureConfig(captureConfig)
+                .build()
+            audioRecord = record
+            record.startRecording()
+            running = true
+            log("audio capture started, state=${record.recordingState}")
 
-        captureThread = Thread {
-            val chunkFloats = 8000 // 0.5 秒 @16kHz
-            val floatBuf = FloatArray(chunkFloats)
-            val byteBuf = ByteBuffer.allocate(chunkFloats * 4).order(ByteOrder.LITTLE_ENDIAN)
-            while (running) {
-                var total = 0
-                while (total < chunkFloats && running) {
-                    val n = record.read(floatBuf, total, chunkFloats - total, AudioRecord.READ_BLOCKING)
-                    if (n <= 0) break
-                    total += n
+            captureThread = Thread {
+                val chunkFloats = 8000 // 0.5 秒 @16kHz
+                val floatBuf = FloatArray(chunkFloats)
+                val byteBuf = ByteBuffer.allocate(chunkFloats * 4).order(ByteOrder.LITTLE_ENDIAN)
+                var silentMax = 0f
+                while (running) {
+                    var total = 0
+                    while (total < chunkFloats && running) {
+                        val n = record.read(floatBuf, total, chunkFloats - total, AudioRecord.READ_BLOCKING)
+                        if (n <= 0) break
+                        total += n
+                    }
+                    if (total <= 0) break
+                    chunkCount++
+                    if (chunkCount % 40L == 0L) { // 每 ~20 秒报告一次
+                        for (i in 0 until total step 7) {
+                            val v = Math.abs(floatBuf[i])
+                            if (v > silentMax) silentMax = v
+                        }
+                        log("fed ${chunkCount} chunks, peak≈${"%.3f".format(silentMax)}")
+                        silentMax = 0f
+                    }
+                    byteBuf.clear()
+                    for (i in 0 until total) byteBuf.putFloat(floatBuf[i])
+                    val b64 = Base64.encodeToString(byteBuf.array(), Base64.NO_WRAP)
+                    mainHandler?.post {
+                        webView?.evaluateJavascript(
+                            "window.__feedAudio && window.__feedAudio('$b64')", null,
+                        )
+                    }
                 }
-                if (total <= 0) break
-                byteBuf.clear()
-                for (i in 0 until total) byteBuf.putFloat(floatBuf[i])
-                val b64 = Base64.encodeToString(byteBuf.array(), Base64.NO_WRAP)
-                mainHandler?.post {
-                    webView?.evaluateJavascript(
-                        "window.__feedAudio && window.__feedAudio('$b64')", null,
-                    )
-                }
-            }
-        }.also { it.start() }
+                log("capture thread exited")
+            }.also { it.start() }
+        } catch (e: Exception) {
+            log("startCapture FAILED: $e")
+        }
     }
 
     /* ---------------- 模型代理（filesDir 缓存 → hf-mirror） ---------------- */
@@ -239,7 +346,9 @@ class SubtitleService : Service() {
     private fun serveCached(url: String, rel: String, mime: String): WebResourceResponse {
         val file = File(filesDir, "models/$rel")
         if (!file.exists() || file.length() == 0L) {
+            log("model download start: $rel")
             downloadTo(url, file)
+            log("model download done: $rel (${file.length() / 1048576}MB)")
         }
         val headers = mapOf(
             "Access-Control-Allow-Origin" to "*",
@@ -291,6 +400,7 @@ class SubtitleService : Service() {
 
     override fun onDestroy() {
         running = false
+        log("service destroy")
         try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
@@ -300,7 +410,7 @@ class SubtitleService : Service() {
             mainHandler?.post {
                 webView?.let { wv ->
                     try {
-                        (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+                        (wv.parent as? ViewGroup)?.removeView(wv)
                         wv.destroy()
                     } catch (_: Exception) {}
                 }
@@ -313,5 +423,17 @@ class SubtitleService : Service() {
     companion object {
         private const val CHANNEL_ID = "live_subtitle"
         private const val NOTIF_ID = 100
+
+        // 探针：读取页面内部状态（__appReady/__appError/桥接函数是否就位）
+        private const val PROBE_JS = (
+            "(function(){try{return JSON.stringify({" +
+                "ready:!!window.__appReady," +
+                "started:!!window.__appStarted," +
+                "err:window.__appError||null," +
+                "vosk:typeof Vosk," +
+                "feed:typeof window.__feedAudio," +
+                "sub:" + "(function(){var z=document.getElementById('sub-zh');return z?z.textContent.slice(0,40):'no-el'})()" +
+            "})}catch(e){return 'probe-err:'+e}})()"
+        )
     }
 }
