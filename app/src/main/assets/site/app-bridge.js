@@ -61,6 +61,29 @@
     zh.style.lineHeight = '1.4';
   };
 
+  // 结果推送到原生 TextView（WebView 渲染兜底：字幕由原生控件显示）
+  function pushNative(text) {
+    try {
+      if (window.AndroidBridge && AndroidBridge.onSubtitle) {
+        AndroidBridge.onSubtitle(String(text == null ? '' : text));
+      }
+    } catch (e) {}
+  }
+  if (typeof MutationObserver !== 'undefined') {
+    const zhEl = document.getElementById('sub-zh');
+    if (zhEl) {
+      new MutationObserver(() => { pushNative(zhEl.textContent || ''); })
+        .observe(zhEl, { childList: true, characterData: true, subtree: true });
+    }
+  }
+  const origShowError = window.showError;
+  window.showError = function (m) {
+    try { if (origShowError) origShowError(m); } catch (e) {}
+    try {
+      if (window.AndroidBridge && AndroidBridge.onStatus) AndroidBridge.onStatus('⚠ ' + m);
+    } catch (e) {}
+  };
+
   // progress-area 在悬浮窗里被隐藏，轮询其文本镜像到字幕区（setProgress 是 const，无法劫持）
   setInterval(() => {
     if (window.__appReady) return;

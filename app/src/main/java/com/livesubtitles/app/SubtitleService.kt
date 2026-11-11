@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
@@ -17,12 +19,14 @@ import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.IBinder
 import android.util.Base64
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.ConsoleMessage
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -45,9 +49,11 @@ import java.util.Locale
 
 /**
  * 前台服务：
- * 1) MediaProjection 内录其他 App 的媒体音频，重采样为 16kHz 单声道
- * 2) 两个悬浮窗：字幕窗（透明 WebView，触摸穿透）+ 控制条窗（可触摸：拖动/字号/透明度/关闭）
- * 3) /models/ 路径请求代理：本地缓存优先，未命中从 hf-mirror 下载（中国网络可达）
+ * 1) MediaProjection 内录其他 App 的媒体音频 → 16kHz 单声道
+ * 2) 隐形 WebView 只做"计算引擎"（Vosk 识别 + OPUS-MT 翻译），
+ *    结果经 JS 桥推送到【原生 TextView 字幕】——不依赖 WebView 渲染，保证可见
+ * 3) 控制条窗：拖动 / 字号 / 透明度 / 关闭（全部原生实现）
+ * 4) /models/ 代理：本地缓存优先，未命中从 hf-mirror 下载
  */
 class SubtitleService : Service() {
 
@@ -61,17 +67,65 @@ class SubtitleService : Service() {
     private var subParams: WindowManager.LayoutParams? = null
     private var ctrlParams: WindowManager.LayoutParams? = null
     private var wm: WindowManager? = null
+    private var subText: TextView? = null
+    private var subPill: GradientDrawable? = null
     private var logFile: File? = null
+    private var lastShown: String = ""
     @Volatile private var running = false
     @Volatile private var chunkCount = 0L
-    private var fontSize = 22
-    private var bgOpacity = 35 // 百分比
+    @Volatile private var gotAnyPush = false
+    private var fontSize = 20   // sp
+    private var bgOpacity = 40  // 百分比
+    private var engineReady = false
     private val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     private fun log(msg: String) {
         val line = "[${fmt.format(Date())}] $msg"
         try { logFile?.appendText(line + "\n") } catch (_: Exception) {}
         android.util.Log.i("LiveSub", line)
+    }
+
+    /* ---------- 原生字幕显示（JS 桥推送的唯一出口） ---------- */
+
+    private fun showSubtitle(text: String) {
+        mainHandler?.post {
+            val tv = subText ?: return@post
+            if (text.startsWith("✅ READY")) engineReady = true
+            if (text.isNotEmpty()) gotAnyPush = true
+            if (text == lastShown) return@post
+            lastShown = text
+            tv.text = text
+            tv.visibility = if (text.isEmpty()) View.INVISIBLE else View.VISIBLE
+        }
+    }
+
+    private fun showStatus(text: String) {
+        mainHandler?.post {
+            val tv = subText ?: return@post
+            if (text == lastShown) return@post
+            lastShown = text
+            engineReady = false
+            tv.text = text
+            tv.visibility = View.VISIBLE
+        }
+    }
+
+    private fun markReady() {
+        mainHandler?.post {
+            engineReady = true
+            lastShown = READY_TEXT
+            subText?.text = READY_TEXT
+            subText?.visibility = View.VISIBLE
+        }
+    }
+
+    /** JS 桥：网页引擎把识别/翻译结果和状态推给原生 */
+    inner class SubtitleBridge {
+        @JavascriptInterface
+        fun onSubtitle(text: String) { showSubtitle(text) }
+
+        @JavascriptInterface
+        fun onStatus(text: String) { showStatus(text) }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -83,13 +137,12 @@ class SubtitleService : Service() {
         val lang = intent.getStringExtra("lang") ?: "en"
 
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
-        fontSize = prefs.getInt("fontSize", 22)
-        bgOpacity = prefs.getInt("bgOpacity", 35)
+        fontSize = prefs.getInt("fontSize", 20)
+        bgOpacity = prefs.getInt("bgOpacity", 40)
 
         logFile = File(filesDir, "live-subtitles.log")
         log("service start, lang=$lang, font=$fontSize, opacity=$bgOpacity, sdk=${android.os.Build.VERSION.SDK_INT}")
 
-        // API 34+ 要求：必须在 getMediaProjection 之前进入 mediaProjection 类型的前台服务
         createNotificationChannel()
         val notification: Notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("实时字幕运行中")
@@ -110,6 +163,7 @@ class SubtitleService : Service() {
         projection = try {
             mpm.getMediaProjection(resultCode, data)
         } catch (e: Exception) {
+            showStatus("⚠ 屏幕录制授权失败")
             log("getMediaProjection FAILED: $e")
             stopSelf(); return START_NOT_STICKY
         }
@@ -121,7 +175,7 @@ class SubtitleService : Service() {
         return START_NOT_STICKY
     }
 
-    /* ---------------- 悬浮窗：字幕窗（穿透） + 控制条（可拖） ---------------- */
+    /* ---------------- 悬浮窗 ---------------- */
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -130,7 +184,7 @@ class SubtitleService : Service() {
         val h = resources.displayMetrics.heightPixels
         val subH = (h * 0.24).toInt()
 
-        // —— 字幕窗：不可触摸，触摸事件全部穿透 ——
+        // —— 字幕窗：原生 TextView，触摸穿透 ——
         subParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             subH,
@@ -144,18 +198,40 @@ class SubtitleService : Service() {
         subParams!!.x = 0
         subParams!!.y = 0
 
-        val wv = createWebView(lang)
+        val pill = GradientDrawable().apply {
+            setColor(Color.argb(bgOpacity * 255 / 100, 8, 10, 18))
+            cornerRadius = dp(16).toFloat()
+        }
+        subPill = pill
+
+        val tv = TextView(this).apply {
+            background = pill
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSize.toFloat())
+            setTypeface(typeface, Typeface.BOLD)
+            setShadowLayer(6f, 1f, 1f, Color.BLACK)
+            setPadding(dp(18), dp(10), dp(18), dp(12))
+            maxLines = 3
+            text = "⏳ 正在启动字幕引擎…"
+            visibility = View.VISIBLE
+        }
+        subText = tv
+
         val subBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            gravity = Gravity.BOTTOM
             setBackgroundColor(Color.TRANSPARENT)
         }
-        subBox.addView(wv, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        subBox.addView(tv, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.BOTTOM
+            setMargins(dp(24), 0, dp(24), dp(10))
+        })
         windowManager.addView(subBox, subParams)
         subtitleRoot = subBox
-        webView = wv
 
-        // —— 控制条窗：可触摸（拖动/字号/透明度/关闭） ——
+        // —— 控制条窗 ——
         ctrlParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -172,19 +248,23 @@ class SubtitleService : Service() {
         windowManager.addView(bar, ctrlParams)
         controlRoot = bar
 
-        log("overlays added; loading page…")
+        // —— 隐形计算引擎 WebView（1px 挂在字幕窗里，保证视图树内正常运行） ——
+        val wv = createEngineWebView(lang)
+        webView = wv
+        subBox.addView(wv, LinearLayout.LayoutParams(1, 1))
+        log("engine webview created (1px, in-hierarchy), loading page…")
         wv.loadUrl("https://appassets.androidplatform.net/assets/site/index.html?lang=$lang&app=1")
     }
 
-    private fun createWebView(lang: String): WebView {
+    private fun createEngineWebView(lang: String): WebView {
         val wv = WebView(this)
         wv.setBackgroundColor(Color.TRANSPARENT)
-        wv.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         wv.settings.javaScriptEnabled = true
         wv.settings.domStorageEnabled = true
         wv.settings.mediaPlaybackRequiresUserGesture = false
         wv.settings.cacheMode = WebSettings.LOAD_DEFAULT
         wv.settings.allowFileAccess = false
+        wv.addJavascriptInterface(SubtitleBridge(), "AndroidBridge")
 
         val loader = WebViewAssetLoader.Builder()
             .setDomain("appassets.androidplatform.net")
@@ -197,15 +277,12 @@ class SubtitleService : Service() {
                 request: WebResourceRequest,
             ): WebResourceResponse? {
                 val path = request.url.path ?: return null
-                // 页面在 /assets/site/ 下，相对路径 ./models/... 会解析为
-                // /assets/site/models/...；统一按 "最后一个 /models/ 之后" 提取
                 if (path.contains("/models/")) {
                     val rel = path.substringAfter("/models/").trimStart('/')
-                    val resp = try { serveModelRel(rel) } catch (e: Exception) {
+                    return try { serveModelRel(rel) } catch (e: Exception) {
                         log("model serve FAILED $rel: $e")
                         notFound()
                     }
-                    return resp
                 }
                 return loader.shouldInterceptRequest(request.url)
             }
@@ -218,9 +295,17 @@ class SubtitleService : Service() {
                         "window.__appStart && window.__appStart('$lang')", null,
                     )
                 }
-                // 应用字号/透明度（等桥接就绪，多试两次）
-                listOf(1500L, 4000L).forEach { d ->
-                    mainHandler?.postDelayed({ applyStyleToWeb() }, d)
+                // 看门狗：若引擎一直没有任何推送（页面挂了），把探针结果显示在字幕上
+                listOf(12000L, 25000L).forEach { d ->
+                    mainHandler?.postDelayed({
+                        if (gotAnyPush) return@postDelayed
+                        webView?.evaluateJavascript(PROBE_JS) { r ->
+                            log("probe: " + r.take(200))
+                            if (!gotAnyPush) {
+                                showStatus("⏳ 引擎状态: " + r.replace("\"", "").take(60))
+                            }
+                        }
+                    }, d)
                 }
             }
         }
@@ -231,12 +316,6 @@ class SubtitleService : Service() {
             }
         }
         return wv
-    }
-
-    private fun applyStyleToWeb() {
-        webView?.evaluateJavascript(
-            "window.__setSubStyle && window.__setSubStyle($fontSize, ${bgOpacity / 100.0})", null,
-        )
     }
 
     private fun buildControlBar(windowManager: WindowManager): LinearLayout {
@@ -257,7 +336,6 @@ class SubtitleService : Service() {
             return tv
         }
 
-        // 拖动把手
         val handle = TextView(this).apply {
             text = "⠿"
             setTextColor(0xFF8B96AD.toInt())
@@ -276,7 +354,6 @@ class SubtitleService : Service() {
                 MotionEvent.ACTION_MOVE -> {
                     val sp = subParams ?: return@setOnTouchListener true
                     val cp = ctrlParams ?: return@setOnTouchListener true
-                    // gravity=BOTTOM：向上拖 → y 增大
                     val dy = (downRawY - ev.rawY).toInt()
                     val maxY = (resources.displayMetrics.heightPixels * 0.72).toInt()
                     val ny = (startY + dy).coerceIn(0, maxY)
@@ -295,18 +372,25 @@ class SubtitleService : Service() {
 
         bar.addView(mkBtn("A−") {
             fontSize = (fontSize - 2).coerceAtLeast(14)
-            savePrefs(); applyStyleToWeb()
+            savePrefs(); applyNativeStyle()
         })
         bar.addView(mkBtn("A+") {
             fontSize = (fontSize + 2).coerceAtMost(36)
-            savePrefs(); applyStyleToWeb()
+            savePrefs(); applyNativeStyle()
         })
         bar.addView(mkBtn("◐") {
-            bgOpacity = when (bgOpacity) { 35 -> 15; 15 -> 55; else -> 35 }
-            savePrefs(); applyStyleToWeb()
+            bgOpacity = when (bgOpacity) { 40 -> 15; 15 -> 60; else -> 40 }
+            savePrefs(); applyNativeStyle()
         })
         bar.addView(mkBtn("✕") { stopSelf() })
         return bar
+    }
+
+    private fun applyNativeStyle() {
+        mainHandler?.post {
+            subText?.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSize.toFloat())
+            subPill?.alpha = (bgOpacity * 255 / 100)
+        }
     }
 
     private fun savePrefs() {
@@ -372,6 +456,7 @@ class SubtitleService : Service() {
             }.also { it.start() }
         } catch (e: Exception) {
             log("startCapture FAILED: $e")
+            showStatus("⚠ 音频采集失败: ${e.message}")
         }
     }
 
@@ -475,15 +560,9 @@ class SubtitleService : Service() {
         try { projection?.stop() } catch (_: Exception) {}
         projection = null
         mainHandler?.post {
-            subtitleRoot?.let { v ->
-                try { (wm)?.removeView(v) } catch (_: Exception) {}
-            }
-            controlRoot?.let { v ->
-                try { (wm)?.removeView(v) } catch (_: Exception) {}
-            }
-            webView?.let { wv ->
-                try { wv.destroy() } catch (_: Exception) {}
-            }
+            subtitleRoot?.let { v -> try { wm?.removeView(v) } catch (_: Exception) {} }
+            controlRoot?.let { v -> try { wm?.removeView(v) } catch (_: Exception) {} }
+            webView?.let { wv -> try { wv.destroy() } catch (_: Exception) {} }
             subtitleRoot = null; controlRoot = null; webView = null
         }
         super.onDestroy()
@@ -492,5 +571,16 @@ class SubtitleService : Service() {
     companion object {
         private const val CHANNEL_ID = "live_subtitle"
         private const val NOTIF_ID = 100
+        private const val READY_TEXT = "✅ READY · 模型就绪，开始播放吧"
+
+        private const val PROBE_JS = (
+            "(function(){try{return JSON.stringify({" +
+                "ready:!!window.__appReady," +
+                "started:!!window.__appStarted," +
+                "err:window.__appError||null," +
+                "vosk:typeof Vosk," +
+                "feed:typeof window.__feedAudio" +
+            "})}catch(e){return 'probe-err:'+e}})()"
+        )
     }
 }
