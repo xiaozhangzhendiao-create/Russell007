@@ -70,7 +70,6 @@ class SubtitleService : Service() {
     private var subtitleRoot: View? = null
     private var controlRoot: View? = null
     private var subParams: WindowManager.LayoutParams? = null
-    private var ctrlParams: WindowManager.LayoutParams? = null
     private var wm: WindowManager? = null
     private var subText: TextView? = null
     private var subPill: GradientDrawable? = null
@@ -244,6 +243,21 @@ class SubtitleService : Service() {
             setMargins(dp(24), 0, dp(24), dp(10))
         })
 
+        // —— 控制条：与字幕同窗，天然零间距贴靠 ——
+        val bar = buildControlBar(subBox)
+        val barWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        barWrap.addView(bar)
+        // 控制条插在字幕框下方（同窗内 LinearLayout 顺序布局，间距=barWrap 的 0 边距）
+        subBox.addView(barWrap, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.BOTTOM
+        })
+        controlRoot = bar
+
         // —— 隐形计算引擎 WebView（1px 挂在视图树里） ——
         val wv = createEngineWebView(lang)
         webView = wv
@@ -252,46 +266,9 @@ class SubtitleService : Service() {
         windowManager.addView(subBox, subParams)
         subtitleRoot = subBox
 
-        // 控制条始终贴靠字幕胶囊顶部（按实际渲染高度）
-        tv.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
-            override fun onGlobalLayout() { repositionControl() }
-        })
-
-        // —— 控制条窗 ——
-        ctrlParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT,
-        )
-        ctrlParams!!.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-        ctrlParams!!.y = subH
-        ctrlParams!!.x = 0
-
-        val bar = buildControlBar(windowManager)
-        windowManager.addView(bar, ctrlParams)
-        controlRoot = bar
-
         log("overlays added; loading page…")
         wv.loadUrl("https://appassets.androidplatform.net/assets/site/index.html?lang=$lang&app=1")
         pokeControls()
-    }
-
-    /** 控制条贴到字幕胶囊上沿 */
-    private fun repositionControl() {
-        val sp = subParams ?: return
-        val cp = ctrlParams ?: return
-        val tv = subText ?: return
-        if (tv.height <= 0) return
-        val pillH = tv.height + dp(10) // 底边距
-        val pillTopFromBottom = sp.y + sp.height - pillH
-        val ny = (pillTopFromBottom + dp(2)).coerceAtLeast(0)
-        if (cp.y != ny) {
-            cp.y = ny
-            try { controlRoot?.let { wm?.updateViewLayout(it, cp) } } catch (_: Exception) {}
-        }
     }
 
     private fun createEngineWebView(lang: String): WebView {
@@ -357,7 +334,7 @@ class SubtitleService : Service() {
         return wv
     }
 
-    private fun buildControlBar(windowManager: WindowManager): LinearLayout {
+    private fun buildControlBar(parent: ViewGroup): LinearLayout {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -380,7 +357,7 @@ class SubtitleService : Service() {
             return tv
         }
 
-        // 拖动把手
+        // 拖动把手：整组（字幕+控制条）上下移动
         val handle = TextView(this).apply {
             text = "⠿"
             setTextColor(0xFF8B96AD.toInt())
@@ -404,8 +381,7 @@ class SubtitleService : Service() {
                     val ny = (startY + dy).coerceIn(0, maxY)
                     if (sp.y != ny) {
                         sp.y = ny
-                        try { subtitleRoot?.let { windowManager.updateViewLayout(it, sp) } } catch (_: Exception) {}
-                        repositionControl()
+                        try { subtitleRoot?.let { wm?.updateViewLayout(it, sp) } } catch (_: Exception) {}
                     }
                     true
                 }
@@ -566,7 +542,14 @@ class SubtitleService : Service() {
         val file = File(filesDir, "models/$rel")
         if (!file.exists() || file.length() == 0L) {
             log("model download start: $rel")
-            downloadTo(url, file)
+            showStatus("⬇ 下载模型: ${shortName(rel)}")
+            downloadTo(url, file) { done, total ->
+                if (total > 0) {
+                    showStatus("⬇ ${shortName(rel)} ${done / 1048576}/${total / 1048576}MB")
+                } else {
+                    showStatus("⬇ ${shortName(rel)} ${done / 1048576}MB")
+                }
+            }
             log("model download done: $rel (${file.length() / 1048576}MB)")
         }
         val headers = mapOf(
@@ -578,7 +561,15 @@ class SubtitleService : Service() {
         return WebResourceResponse(mime, null, 200, "OK", headers, file.inputStream())
     }
 
-    private fun downloadTo(url: String, dest: File) {
+    private fun shortName(rel: String): String = when {
+        rel.contains("en-us") && rel.endsWith(".zip") -> "英文识别模型"
+        rel.contains("ja") && rel.endsWith(".zip") -> "日文识别模型"
+        rel.startsWith("opus-mt-en-zh") -> "英中翻译模型"
+        rel.startsWith("opus-mt-ja-en") -> "日英翻译模型"
+        else -> rel.take(20)
+    }
+
+    private fun downloadTo(url: String, dest: File, onProgress: (Long, Long) -> Unit) {
         dest.parentFile?.mkdirs()
         val tmp = File(dest.absolutePath + ".part")
         var lastErr: IOException? = null
@@ -590,8 +581,23 @@ class SubtitleService : Service() {
                 conn.instanceFollowRedirects = true
                 conn.connect()
                 if (conn.responseCode !in 200..299) throw IOException("HTTP ${conn.responseCode}")
+                val total = conn.contentLengthLong
                 conn.inputStream.use { input ->
-                    FileOutputStream(tmp).use { out -> input.copyTo(out, 1 shl 16) }
+                    FileOutputStream(tmp).use { out ->
+                        val buf = ByteArray(1 shl 16)
+                        var done = 0L
+                        var lastReport = 0L
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                            done += n
+                            if (done - lastReport > 512 * 1024) { // 每 0.5MB 汇报一次
+                                lastReport = done
+                                onProgress(done, total)
+                            }
+                        }
+                    }
                 }
                 if (!tmp.renameTo(dest)) throw IOException("rename failed")
                 return
