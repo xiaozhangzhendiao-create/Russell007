@@ -35,11 +35,25 @@
   }
   if (typeof onPartial === 'function') {
     const origPartial = onPartial;
-    onPartial = function (t) { resetReadyMark(); origPartial(t); };
+    onPartial = function (t) {
+      resetReadyMark();
+      try {
+        // 把"原文小字行"清空（英文识别过程不上屏由 __translationOnly 控制）
+        if (window.AndroidBridge && AndroidBridge.onSubtitleOrig) AndroidBridge.onSubtitleOrig('');
+      } catch (e) {}
+      // 仅译文模式下，英文 partial 不进入字幕区，保持上一句中文常驻
+      if (!window.__translationOnly) origPartial(t);
+    };
   }
   if (typeof onFinal === 'function') {
     const origFinal = onFinal;
-    onFinal = function (t) { resetReadyMark(); origFinal(t); };
+    onFinal = function (t) {
+      resetReadyMark();
+      origFinal(t);
+      try {
+        if (window.AndroidBridge && AndroidBridge.onSubtitleOrig) AndroidBridge.onSubtitleOrig(String(t || ''));
+      } catch (e) {}
+    };
   }
 
   // 字幕样式控制（原生控制条调用）：胶囊底 + 可调字号/透明度
