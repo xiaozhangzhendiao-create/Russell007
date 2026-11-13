@@ -1,6 +1,7 @@
 package com.livesubtitles.app
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -23,6 +24,8 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        installCrashHandler()
+
         langSpinner = findViewById(R.id.lang_spinner)
         statusText = findViewById(R.id.status_text)
         langSpinner.adapter = ArrayAdapter(
@@ -30,6 +33,12 @@ class MainActivity : AppCompatActivity() {
             android.R.layout.simple_spinner_dropdown_item,
             listOf(getString(R.string.lang_en), getString(R.string.lang_ja)),
         )
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            try {
+                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 200)
+            } catch (_: Exception) {}
+        }
 
         findViewById<Button>(R.id.start_btn).setOnClickListener {
             if (!Settings.canDrawOverlays(this)) {
@@ -51,6 +60,50 @@ class MainActivity : AppCompatActivity() {
             stopService(Intent(this, SubtitleService::class.java))
             statusText.text = getString(R.string.status_idle)
         }
+
+        findViewById<Button>(R.id.log_btn).setOnClickListener { showLogs() }
+    }
+
+    /** 未捕获异常写入文件，便于远程排错 */
+    private fun installCrashHandler() {
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                val f = java.io.File(filesDir, "crash.log")
+                f.appendText(
+                    "\n===== ${java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
+                        .format(java.util.Date())} =====\n" +
+                        throwable.stackTraceToString() + "\n",
+                )
+            } catch (_: Exception) {}
+            prev?.uncaughtException(thread, throwable)
+        }
+    }
+
+    private fun readTail(file: java.io.File, maxBytes: Int = 6000): String {
+        return try {
+            if (!file.exists()) return "(无)"
+            val text = file.readText()
+            if (text.length <= maxBytes) text else "…(前略)\n" + text.takeLast(maxBytes)
+        } catch (e: Exception) { "(读取失败: ${e.message})" }
+    }
+
+    private fun showLogs() {
+        val crash = readTail(java.io.File(filesDir, "crash.log"), 4000)
+        val run = readTail(java.io.File(filesDir, "live-subtitles.log"), 6000)
+        val msg = "【崩溃日志】\n$crash\n\n【运行日志】\n$run"
+        AlertDialog.Builder(this)
+            .setTitle("诊断日志（可截图反馈）")
+            .setMessage(msg)
+            .setPositiveButton("关闭", null)
+            .setNeutralButton("清空") { _, _ ->
+                try {
+                    java.io.File(filesDir, "crash.log").delete()
+                    java.io.File(filesDir, "live-subtitles.log").delete()
+                    Toast.makeText(this, "已清空", Toast.LENGTH_SHORT).show()
+                } catch (_: Exception) {}
+            }
+            .show()
     }
 
     @Deprecated("Deprecated in Java")
@@ -63,9 +116,13 @@ class MainActivity : AppCompatActivity() {
                 .putExtra("resultCode", resultCode)
                 .putExtra("data", data)
                 .putExtra("lang", lang)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(svc)
-            else startService(svc)
-            statusText.text = "状态：运行中（首次加载模型需要一些时间，请耐心等待）"
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(svc)
+                else startService(svc)
+                statusText.text = "状态：运行中（首次加载模型需要一些时间，请耐心等待）"
+            } catch (e: Exception) {
+                statusText.text = "启动失败：${e.message}"
+            }
         } else {
             Toast.makeText(this, "未授予屏幕录制权限，无法内录视频声音", Toast.LENGTH_LONG).show()
         }

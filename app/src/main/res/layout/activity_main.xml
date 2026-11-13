@@ -68,6 +68,18 @@
         android:textColor="#22c58b"
         android:textSize="14sp" />
 
+    <Button
+        android:id="@+id/log_btn"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:backgroundTint="#2a3550"
+        android:paddingLeft="16dp"
+        android:paddingRight="16dp"
+        android:text="诊断日志"
+        android:textColor="#8b96ad"
+        android:textSize="13sp" />
+
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
