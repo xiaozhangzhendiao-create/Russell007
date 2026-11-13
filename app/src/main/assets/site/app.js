@@ -177,8 +177,10 @@ function onFinal(text) {
   if (!state.running) return;
   text = (text || '').trim();
   if (!text) return;
+  if (text === state.lastFinalText) return; // 去重：切句抖动会产生重复
+  state.lastFinalText = text;
   subOriginal.textContent = showOriginalCb.checked ? text : '';
-  subZh.textContent = '…';
+  // 不清空字幕：保留上一句译文，直到新译文就绪（避免出现"…"空窗）
   subZh.classList.add('pending');
   log('final', text);
   translate(text, langSel.value).then(({ zh, en, error }) => {
@@ -188,6 +190,7 @@ function onFinal(text) {
       subZh.classList.remove('pending');
       return;
     }
+    if (!zh) { log('translate dropped'); return; } // 积压被丢弃：保留当前字幕
     if (subOriginal.textContent !== text && showOriginalCb.checked) subOriginal.textContent = text;
     subZh.textContent = zh;
     subZh.classList.remove('pending');

@@ -16,6 +16,7 @@ const pipelines = {};
 const queue = [];
 let busy = false;
 let currentLang = null;
+const MAX_QUEUE = 2; // 只保留最新两句待翻译，避免积压导致延迟无限累积
 
 async function getPipeline(name) {
   if (pipelines[name]) return pipelines[name];
@@ -64,10 +65,16 @@ self.onmessage = async (e) => {
     if (data.lang && data.lang !== currentLang) {
       currentLang = data.lang;
     }
+    // 积压丢弃：队列过长时丢最旧的，优先保证最新内容
+    while (queue.length >= MAX_QUEUE) {
+      const stale = queue.shift();
+      try { stale.dropped(); } catch (err) {}
+    }
     queue.push({
       text: data.text,
       lang: data.lang,
       resolve: (out) => self.postMessage({ type: 'result', id: data.id, zh: out.zh, en: out.en }),
+      dropped: () => self.postMessage({ type: 'result', id: data.id, zh: '', en: '', dropped: true }),
       reject: (err) => self.postMessage({ type: 'error', id: data.id, error: err }),
     });
     run();
@@ -76,9 +83,15 @@ self.onmessage = async (e) => {
     const names = data.lang === 'ja' ? ['opus-mt-ja-en', 'opus-mt-en-zh'] : ['opus-mt-en-zh'];
     try {
       for (const name of names) {
-        await getPipeline(name, null); // progress 由 files 聚合后经 'progress' 消息发出
+        await getPipeline(name); // progress 由 files 聚合后经 'progress' 消息发出
         self.postMessage({ type: 'preloaded', model: name });
       }
+      // 预热一次推理，避免第一句字幕额外等待编译/JIT 开销
+      try {
+        const warmName = data.lang === 'ja' ? 'opus-mt-ja-en' : 'opus-mt-en-zh';
+        const warm = pipelines[warmName];
+        if (warm) await warm('Hello.', { max_new_tokens: 16 });
+      } catch (err) {}
       self.postMessage({ type: 'preload-done' });
     } catch (err) {
       self.postMessage({ type: 'preload-error', error: String(err && err.stack || err) });

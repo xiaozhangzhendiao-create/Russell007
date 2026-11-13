@@ -184,6 +184,13 @@
       state.recognizer = rec;
       window.__appRec = rec; // __feedAudio 从这里取识别器
       state.running = true;
+      // 强制切句：每 2.5 秒结算一次未定稿音频，避免连续说话时翻译迟迟不出
+      if (window.__flushTimer) clearInterval(window.__flushTimer);
+      window.__flushTimer = setInterval(() => {
+        const r = window.__appRec;
+        if (!r || !state.running || video.paused || video.ended) return;
+        try { r.retrieveFinalResult(); } catch (e) {}
+      }, 2500);
       overlay.classList.remove('hidden');
       applyChrome();
       setStatus('ready');
